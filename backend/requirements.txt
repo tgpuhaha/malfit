@@ -4,3 +4,4 @@ python-multipart
 redis
 openai>=1.40.0
 pydantic-settings
+httpx
