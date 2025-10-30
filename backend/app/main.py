@@ -1,8 +1,9 @@
 # app/main.py
-import os, time, uuid, json, shutil, subprocess
-from datetime import datetime
+import os, time, uuid, json, subprocess
 from pathlib import Path
 from typing import Dict
+from datetime import datetime
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -10,12 +11,23 @@ from pydantic_settings import BaseSettings
 import redis
 from openai import OpenAI
 
-# ───────── 추가: 결제/충전코드 라우터
-# payments_claim.py 파일이 루트에 있다면 import 경로를 조정하세요.
-# (현재 구조가 app/ 아래라면 from app.payments_claim import router 로 바꾸세요)
-from payments_claim import router as payments_router
+# ──────────────────────────────────────────────────────────────────────────
+# 라우터 import (파일 위치에 따라 경로 다를 수 있으니 try/except로 유연하게)
+try:
+    from payments_claim import router as payments_router           # /api/woocommerce_webhook, /api/redeem_token
+except Exception:
+    from app.payments_claim import router as payments_router
 
-# ───────── 설정
+try:
+    from app_wordpress_webhook import router as wp_router          # /api/wordpress_payment_webhook (선택)
+except Exception:
+    try:
+        from app.app_wordpress_webhook import router as wp_router
+    except Exception:
+        wp_router = None  # 파일이 없으면 생략
+
+# ──────────────────────────────────────────────────────────────────────────
+# 설정
 class Settings(BaseSettings):
     OPENAI_API_KEY: str
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -33,28 +45,36 @@ OUT.mkdir(parents=True, exist_ok=True)
 r = redis.from_url(S.REDIS_URL, decode_responses=True)
 client = OpenAI(api_key=S.OPENAI_API_KEY)
 
-app = FastAPI(title="malfit-api", version="1.2.0")
+app = FastAPI(title="malfit-api", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if S.ALLOW_ORIGIN == "*" else [S.ALLOW_ORIGIN],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ───────── 여기서 결제/충전코드 라우터 활성화
-app.include_router(payments_router)  # /api/woocommerce_webhook, /api/redeem_token 활성화
+# ──────────────────────────────────────────────────────────────────────────
+# 결제/충전코드 라우터 등록
+app.include_router(payments_router)   # /api/woocommerce_webhook, /api/redeem_token
+if wp_router:
+    app.include_router(wp_router)     # /api/wordpress_payment_webhook (있으면)
 
+# ──────────────────────────────────────────────────────────────────────────
+# Redis 키/로그 유틸
 def k(jid: str) -> str: return f"job:{jid}"
+
 def set_status(jid: str, **kv):
     K = k(jid)
     for kk, vv in kv.items():
-        r.hset(K, kk, json.dumps(vv, ensure_ascii=False) if isinstance(vv,(dict,list)) else str(vv))
+        r.hset(K, kk, json.dumps(vv, ensure_ascii=False) if isinstance(vv, (dict, list)) else str(vv))
+
 def append_log(jid: str, line: str):
     K = k(jid)
     cur = r.hget(K, "log") or ""
     cur = (cur + ("\n" if cur else "") + line)[-4000:]
     r.hset(K, "log", cur)
 
-# ───────── ffprobe/ffmpeg 유틸
+# ──────────────────────────────────────────────────────────────────────────
+# ffprobe/ffmpeg 유틸
 def run_ffmpeg(args: list) -> tuple[bool, str]:
     if "ffmpeg" in args[0] and "-hide_banner" not in args:
         args = args[:1] + ["-hide_banner"] + args[1:]
@@ -68,10 +88,11 @@ def ffprobe_duration(p: Path) -> float:
         cmd = ["ffprobe","-v","error","-show_entries","format=duration",
                "-of","default=noprint_wrappers=1:nokey=1",str(p)]
         run = subprocess.run(cmd, capture_output=True)
-        if run.returncode==0:
-            s=(run.stdout or b"").decode("utf-8","ignore").strip()
+        if run.returncode == 0:
+            s = (run.stdout or b"").decode("utf-8","ignore").strip()
             return float(s) if s else 0.0
-    except: pass
+    except:
+        pass
     return 0.0
 
 def ffprobe_has_audio(src: Path) -> bool:
@@ -81,7 +102,8 @@ def ffprobe_has_audio(src: Path) -> bool:
         p = subprocess.run(cmd, capture_output=True)
         out = (p.stdout or b"").decode("utf-8","ignore").strip()
         return bool(out)
-    except: return False
+    except:
+        return False
 
 def extract_audio_with_fallback(src: Path) -> Path:
     if not ffprobe_has_audio(src):
@@ -102,7 +124,8 @@ def extract_audio_with_fallback(src: Path) -> Path:
 
     raise RuntimeError(f"ffmpeg 추출 실패\n[copy]{e1}\n[aac ]{e2}\n[wav ]{e3}")
 
-# ───────── Whisper/GPT
+# ──────────────────────────────────────────────────────────────────────────
+# Whisper/GPT
 def whisper_srt(audio: Path, language: str) -> str:
     with audio.open("rb") as f:
         resp = client.audio.transcriptions.create(
@@ -129,7 +152,8 @@ def make_vo_text(srt_text: str) -> str:
     )
     return (c.choices[0].message.content or "").strip()
 
-# ───────── 백그라운드 작업
+# ──────────────────────────────────────────────────────────────────────────
+# 백그라운드 작업
 def process_job(jid: str, video_path: str, language: str):
     vid = Path(video_path)
     try:
@@ -137,7 +161,8 @@ def process_job(jid: str, video_path: str, language: str):
         if not vid.exists():
             raise RuntimeError(f"업로드된 파일이 존재하지 않습니다: {vid}")
 
-        dur = ffprobe_duration(vid); set_status(jid, durationSec=dur)
+        dur = ffprobe_duration(vid)
+        set_status(jid, durationSec=dur)
 
         set_status(jid, status="audio_extract", progress=15)
         append_log(jid, f"ffprobe audio? {ffprobe_has_audio(vid)}")
@@ -146,28 +171,35 @@ def process_job(jid: str, video_path: str, language: str):
 
         set_status(jid, status="whisper", progress=40)
         srt = whisper_srt(audio, language)
-        srt_path = (OUT/jid).with_suffix(".srt"); srt_path.write_text(srt, encoding="utf-8")
+        (OUT / f"{jid}.srt").write_text(srt, encoding="utf-8")
 
         set_status(jid, status="rewrite", progress=70)
         rew = rewrite_srt(srt)
-        rew_path = (OUT/f"{jid}_rewritten").with_suffix(".srt"); rew_path.write_text(rew, encoding="utf-8")
+        (OUT / f"{jid}_rewritten.srt").write_text(rew, encoding="utf-8")
 
         set_status(jid, status="vo", progress=85)
         vo = make_vo_text(rew)
-        vo_path = (OUT/f"{jid}_vo").with_suffix(".txt"); vo_path.write_text(vo, encoding="utf-8")
+        (OUT / f"{jid}_vo.txt").write_text(vo, encoding="utf-8")
 
-        set_status(jid, status="done", progress=100,
-                   result=f"/download/{jid}/srt|/download/{jid}/rewritten|/download/{jid}/vo")
+        set_status(
+            jid, status="done", progress=100,
+            result=f"/download/{jid}/srt|/download/{jid}/rewritten|/download/{jid}/vo"
+        )
         append_log(jid, "완료 ✅")
     except Exception as e:
-        set_status(jid, status="error", error=str(e)); append_log(jid, f"에러 ❌ {e}")
+        set_status(jid, status="error", error=str(e))
+        append_log(jid, f"에러 ❌ {e}")
     finally:
         try:
-            if 'audio' in locals() and Path(audio).exists(): Path(audio).unlink(missing_ok=True)
-            if vid.exists(): vid.unlink(missing_ok=True)
-        except: pass
+            if 'audio' in locals() and Path(audio).exists():
+                Path(audio).unlink(missing_ok=True)
+            if vid.exists():
+                vid.unlink(missing_ok=True)
+        except:
+            pass
 
-# ───────── 라우트
+# ──────────────────────────────────────────────────────────────────────────
+# 라우트
 @app.get("/")
 def root(): return {"ok": True, "msg": "malfit api (single-service background)"}
 
@@ -177,16 +209,20 @@ def health(): return {"ok": True, "ts": int(time.time())}
 @app.post("/upload")
 async def upload(background_tasks: BackgroundTasks,
                  file: UploadFile = File(...), language: str = Form("ko")):
-    if not file.filename: raise HTTPException(400, "파일명이 없습니다.")
+    if not file.filename:
+        raise HTTPException(400, "파일명이 없습니다.")
     if not file.filename.lower().endswith((".mp4",".mov",".mkv",".m4v",".webm")):
         raise HTTPException(400, "영상 파일만 허용합니다.")
 
-    jid = str(uuid.uuid4()); dest = UP / f"{jid}.mp4"
+    jid = str(uuid.uuid4())
+    dest = UP / f"{jid}.mp4"
+
     size = 0
     with dest.open("wb") as f:
         while True:
-            chunk = await file.read(1024*1024)
-            if not chunk: break
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
             size += len(chunk)
             if size > S.MAX_MB_FREE * 1024 * 1024:
                 f.close(); dest.unlink(missing_ok=True)
@@ -201,18 +237,20 @@ async def upload(background_tasks: BackgroundTasks,
 @app.get("/jobs/{jid}")
 def job_status(jid: str):
     d = r.hgetall(k(jid))
-    if not d: raise HTTPException(404, "not found")
+    if not d:
+        raise HTTPException(404, "not found")
     return d
 
 @app.get("/download/{jid}/{kind}")
 def download(jid: str, kind: str):
     base = OUT / jid
-    path = {
+    path_map = {
         "srt": base.with_suffix(".srt"),
         "rewritten": base.with_name(f"{jid}_rewritten").with_suffix(".srt"),
-        "vo": base.with_name(f"{jid}_vo").with_suffix(".txt")
-    }.get(kind)
+        "vo": base.with_name(f"{jid}_vo").with_suffix(".txt"),
+    }
+    path = path_map.get(kind)
     if not path or not path.exists():
         raise HTTPException(404, "file not ready")
-    media = "text/plain" if path.suffix==".txt" else "application/x-subrip"
+    media = "text/plain" if path.suffix == ".txt" else "application/x-subrip"
     return FileResponse(str(path), media_type=media, filename=path.name)
