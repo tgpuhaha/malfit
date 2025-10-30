@@ -1,12 +1,16 @@
 # payments_claim.py
-# WooCommerce webhook -> 충전코드 발급, /redeem_token -> 포인트 적립
+# WooCommerce webhook -> 충전코드 발급
+# /redeem_token -> 개별 적립
+# /claim_token  -> 주문번호로 토큰 조회(WP 완료페이지/메일용)
+# /my_claims    -> 말핏 마이페이지: 내 미사용 코드 목록
+# /redeem_my_claims -> 말핏 마이페이지: 내 미사용 코드 일괄 적립
 
 import os, json, hmac, hashlib, base64, smtplib, ssl, secrets, string
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import httpx
-from fastapi import APIRouter, Request, Header, HTTPException
+from fastapi import APIRouter, Request, Header, HTTPException, Depends
 from email.mime.text import MIMEText
 
 router = APIRouter()
@@ -40,6 +44,20 @@ async def sb_select_one(table: str, eq: Dict[str, Any]):
         raise HTTPException(500, f"Supabase select error: {r.text}")
     rows = r.json()
     return rows[0] if rows else None
+
+async def sb_select(table: str, where: Dict[str, Any], select: str = "*", order: Optional[str] = None):
+    params = {"select": select}
+    for k, v in where.items():
+        params[k] = f"eq.{v}"
+    if order:
+        params["order"] = order
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{table}",
+                        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                        params=params)
+    if r.status_code != 200:
+        raise HTTPException(500, f"Supabase select error: {r.text}")
+    return r.json()
 
 async def sb_insert(table: str, row: Dict[str, Any]):
     async with httpx.AsyncClient(timeout=10) as c:
@@ -96,6 +114,23 @@ def send_email(to_email: str, subject: str, body: str):
         s.starttls(context=ctx)
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(MAIL_FROM, [to_email], msg.as_string())
+
+def mask_token(t: str) -> str:
+    return f"{t[:5]}-*****-*****-{t[-5:]}" if t and len(t) > 10 else t
+
+# ── 인증 헬퍼 (프로젝트 로그인 방식에 맞게 조정 가능) ─────────────────────
+def get_current_user(request: Request):
+    # 우선 request.state.* (미들웨어에서 세팅했다고 가정)
+    uid = getattr(request.state, "user_id", None)
+    email = getattr(request.state, "user_email", None)
+    # 테스트/임시: 헤더로도 허용
+    if not uid:
+        uid = request.headers.get("X-User-Id")
+    if not email:
+        email = request.headers.get("X-User-Email")
+    if not uid or not email:
+        raise HTTPException(401, "로그인이 필요합니다")
+    return {"id": str(uid), "email": email}
 
 # ── 1) WooCommerce Webhook → 충전코드 발급 ───────────────────────────────
 @router.post("/api/woocommerce_webhook")
@@ -161,9 +196,8 @@ async def woocommerce_webhook(request: Request,
 # ── 2) 리딤: 로그인 후 코드 입력 → 포인트 적립 ───────────────────────────
 @router.post("/api/redeem_token")
 async def redeem_token(request: Request, body: Dict[str, Any]):
-    # 프로젝트의 인증 방식에 맞게 현재 로그인 user_id/email을 꺼내세요.
-    # 예: request.state.user_id 또는 body["user_id"] 등
-    current_user_id = getattr(request.state, "user_id", None) or body.get("user_id")
+    current_user_id = getattr(request.state, "user_id", None) or body.get("user_id") \
+                      or request.headers.get("X-User-Id")
     if not current_user_id:
         raise HTTPException(401, "로그인이 필요합니다")
 
@@ -191,3 +225,50 @@ async def redeem_token(request: Request, body: Dict[str, Any]):
     })
 
     return {"ok": True, "added": add, "new_total": new_total}
+
+# ── 3) 주문번호로 토큰 조회 (WP 완료페이지/메일에서 사용) ────────────────
+@router.get("/api/claim_token")
+async def claim_token(order_id: str):
+    claim = await sb_select_one("credit_claims", {"order_id": order_id})
+    if not claim:
+        raise HTTPException(404, "not_ready")
+    return {"token": claim["token"], "credits": int(claim["credits"])}
+
+# ── 4) 말핏 마이페이지: 내 미사용 코드 목록 ───────────────────────────────
+@router.get("/api/my_claims")
+async def my_claims(user=Depends(get_current_user)):
+    rows = await sb_select(
+        "credit_claims",
+        {"email": user["email"], "redeemed": False},
+        select="order_id,token,credits,created_at,redeemed",
+        order="created_at.desc"
+    )
+    return [{
+        "order_id": r["order_id"],
+        "token_masked": mask_token(r["token"]),
+        "credits": int(r["credits"]),
+        "created_at": r["created_at"],
+    } for r in rows]
+
+# ── 5) 말핏 마이페이지: 내 미사용 코드 일괄 적립 ──────────────────────────
+@router.post("/api/redeem_my_claims")
+async def redeem_my_claims(user=Depends(get_current_user)):
+    rows = await sb_select(
+        "credit_claims",
+        {"email": user["email"], "redeemed": False},
+        select="token,credits"
+    )
+    if not rows:
+        return {"ok": True, "added": 0, "count": 0}
+
+    total_add = sum(int(r["credits"]) for r in rows)
+    new_total = await sb_add_credits(user["id"], total_add)
+
+    for r in rows:
+        await sb_update("credit_claims", {"token": r["token"]}, {
+            "redeemed": True,
+            "redeemed_at": datetime.now(timezone.utc).isoformat(),
+            "redeemed_user_id": user["id"]
+        })
+
+    return {"ok": True, "added": total_add, "count": len(rows), "new_total": new_total}
